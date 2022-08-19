@@ -66,15 +66,14 @@ typedef struct imu_real
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define lsm6ds3  //lsm3ds3  or  mpu6500
-#define debug 0
 #define DATA_EVENT_START (0x01 << 0)
 #define DATA_EVENT_END (0x01 << 0)
 #define use_fifo 0
 //three information can only choose one
-#define print_raw_data 1
+#define print_raw_data 0
 #define print_fir_data 0
 #define print_raw_fir_data 0
-#define print_rpy_data 0
+#define print_rpy_data 1
 #define print_quat_data 0
 //gravity constant
 #define gravity 9.7955f   // m/(s*s)
@@ -104,11 +103,6 @@ uint16_t HLdata[7];//0:temperature; 1~3 acc; 4~6 gyro
 imu_real_t imu_data_fifo[52];
 imu_real_t imu_data_fir;
 uint64_t imu_data_counts;
-#if debug
-uint32_t time1, time2, dtime12;
-float hz;
-uint32_t fifo_bytes_available;
-#endif
 
 //usb serial
 char usb_string[200];
@@ -200,7 +194,7 @@ void MX_FREERTOS_Init(void) {
 		/* Create the event(s) */
 		/* creation of myEventData */
 		myEventDataStartHandle = osEventFlagsNew(&myEventDataStart_attributes);
-
+		myEventDataEndHandle = osEventFlagsNew(&myEventDataEnd_attributes);
     /* USER CODE BEGIN RTOS_THREADS */
     /* add threads, ... */
     /* USER CODE END RTOS_THREADS */
@@ -225,7 +219,7 @@ void StartDefaultTask(void *argument)
     for(;;)
     {
 			//HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-			//HAL_Delay(led_delay);
+			HAL_Delay(1);
     }
     /* USER CODE END StartDefaultTask */
 }
@@ -352,6 +346,7 @@ void StartTaskMPU(void *argument)
 
 		// calculate imu error
 		imu_real_t imu_error;
+		osEventFlagsSet(myEventDataEndHandle, DATA_EVENT_END);
     /* Infinite loop */
     for(;;)
     {
