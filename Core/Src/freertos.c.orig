@@ -1,0 +1,375 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2022 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "i2c.h"
+#include "mpu6xxx_reg.h"
+#include "crc.h"
+#include "arm_math.h"
+#include <string.h>
+#include <tim.h>
+#include "RingBuffer.h"
+#include "usbd_cdc_if.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct imu_read
+{
+    uint16_t acclx;
+    uint16_t accly;
+    uint16_t acclz;
+    uint16_t gyrox;
+    uint16_t gyroy;
+    uint16_t gyroz;
+    uint16_t crc32h;
+    uint16_t crc32l;
+} imu_read_t;
+
+typedef struct imu_real
+{
+    float acclx; //m/ss
+    float accly;
+    float acclz;
+    float gyrox; //rad
+    float gyroy;
+    float gyroz;
+} imu_real_t;
+
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define lsm6ds3  //lsm3ds3  or  mpu6500
+#define debug 0
+#define DATA_EVENT (0x01 << 0)
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+uint16_t led_delay = 1000;
+uint8_t status_sum = 0;
+imu_read_t imu_read_data;
+imu_real_t imu_real_data;
+uint16_t HLdata[7];//0:temperature; 1~3 acc; 4~6 gyro
+#if debug
+uint32_t time1, time2, dtime12;
+float hz;
+uint32_t fifo_bytes_available;
+#endif
+/* USER CODE END Variables */
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+    .name = "defaultTask",
+    .stack_size = 128 * 4,
+    .priority = (osPriority_t) osPriorityRealtime,
+};
+/* Definitions for myTaskMPU */
+osThreadId_t myTaskMPUHandle;
+const osThreadAttr_t myTaskMPU_attributes = {
+    .name = "myTaskMPU",
+    .stack_size = 128 * 4,
+    .priority = (osPriority_t) osPriorityRealtime,
+};
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+void LedStatus(HAL_StatusTypeDef stat);
+/* USER CODE END FunctionPrototypes */
+
+void StartDefaultTask(void *argument);
+void StartTaskMPU(void *argument);
+
+extern void MX_USB_DEVICE_Init(void);
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+	
+    /* USER CODE BEGIN RTOS_MUTEX */
+    /* add mutexes, ... */
+    /* USER CODE END RTOS_MUTEX */
+
+    /* USER CODE BEGIN RTOS_SEMAPHORES */
+    /* add semaphores, ... */
+    /* USER CODE END RTOS_SEMAPHORES */
+
+    /* USER CODE BEGIN RTOS_TIMERS */
+    /* start timers, add new ones, ... */
+    /* USER CODE END RTOS_TIMERS */
+
+    /* Create the queue(s) */
+
+    /* USER CODE BEGIN RTOS_QUEUES */
+    /* add queues, ... */
+    /* USER CODE END RTOS_QUEUES */
+
+    /* Create the thread(s) */
+    /* creation of defaultTask */
+    defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+    /* creation of myTaskMPU */
+    myTaskMPUHandle = osThreadNew(StartTaskMPU, NULL, &myTaskMPU_attributes);
+
+    /* USER CODE BEGIN RTOS_THREADS */
+    /* add threads, ... */
+    /* USER CODE END RTOS_THREADS */
+
+    /* USER CODE BEGIN RTOS_EVENTS */
+    /* add events, ... */
+    /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+    /* USER CODE BEGIN StartDefaultTask */
+    /* Infinite loop */
+    for(;;)
+    {
+        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+        HAL_Delay(led_delay);
+        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+        HAL_Delay(led_delay);
+    }
+    /* USER CODE END StartDefaultTask */
+}
+
+/* USER CODE BEGIN Header_StartTaskMPU */
+/**
+* @brief Function implementing the myTaskMPU thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTaskMPU */
+void StartTaskMPU(void *argument)
+{
+    /* USER CODE BEGIN StartTaskMPU */
+    HAL_I2C_MspInit(&hi2c1);
+    HAL_StatusTypeDef status;
+    HAL_TIM_Base_MspInit(&htim11);
+    uint16_t i2c_rw_delay = 150;
+    uint16_t lsm_addr = 0x6B << 1;
+    uint16_t lsm_reg[1] = {0x0F};
+    uint8_t lsm_d[2] = {0, 0};
+
+    //CTRL3_C
+    lsm_d[0] = 0x12;
+    lsm_d[1] = 0x01;
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //LSM3DS3 WHO AM I
+    status = HAL_I2C_Mem_Read(&hi2c1, lsm_addr, lsm_reg[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    if( status != HAL_OK)
+        LedStatus(status);
+    else if (lsm_d[1] != 0x69)
+        LedStatus(HAL_ERROR);
+    else
+        LedStatus(HAL_OK);
+
+    //FUNC_CFG_ACCESS
+    lsm_d[0] = 0x01;
+    lsm_d[1] = 0x00;
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //FIFO_CTRL5
+    lsm_d[0] = 0x0A;
+    lsm_d[1] = 0x36; //FIFO ODR 416Hz, continus mode
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //ORIENT_CFG_G
+    lsm_d[0] = 0x0B;
+    lsm_d[1] = 0x00; //angular sign (+ + +),orient (x y z)
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //CTRL1_XL
+    lsm_d[0] = 0x10;
+    lsm_d[1] = 0x56; // 208Hz , 16g , Anti-aliasing filter bandwidth : 100Hz
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //CTRL2_G
+    lsm_d[0] = 0x11;
+    lsm_d[1] = 0x5C; // 208Hz , 2000dps
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+
+    //CTRL5_C
+    lsm_d[0] = 0x14;
+    lsm_d[1] = 0x60; // no self_test
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //CTRL6_C
+    lsm_d[0] = 0x15;
+    lsm_d[1] = 0x10; //
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+    //CTRL9_XL
+    lsm_d[0] = 0x18;
+    lsm_d[1] = 0x38; // acc xyz enable
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+
+
+    //CTRL10_C
+    lsm_d[0] = 0x19;
+    lsm_d[1] = 0x38; // gyro xyz enable
+    status = HAL_I2C_Mem_Write(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1, 5);
+    HAL_Delay(10);
+    status_sum |= status;
+		
+    if(status_sum)
+    {
+        LedStatus(HAL_ERROR);
+        status_sum = 0;
+    }
+    else
+    {
+        LedStatus(HAL_OK);
+    }
+
+// imu data
+		// accl -16g~16g  gyro  -2000dps~2000dps imu_data[x] x:1~3 accl.x.y.z, x:4~6 gyro.x.y.z
+		uint16_t imu_data[6] = {0};
+		float accl_lsb = 2047.9375f;
+    float gyro_lsb = 16.3835f;
+		float temp_lsb = 16.0f;
+//create imu data fifo
+    imu_real_t imu_data_fifo[51];
+    imu_real_t imu_data_fir;
+    RingBuffer *imu_fifo = RingBuffer_Malloc(sizeof(imu_data_fifo));
+//usb serial
+    char usb_string[70];
+	
+    /* Infinite loop */
+    for(;;)
+    {
+			//i  0:temperature  1:gyrox 2:gyroy 3:gyroz 4:accx 5:accy 6:accz
+				for(int i=0;i<7;i++)
+				{
+				lsm_d[0] = 0x20 + 2*i + 1;
+        lsm_d[1] = 0x00; // temperature data HIGH
+        status = HAL_I2C_Mem_Read_IT(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1);
+        delay_us(i2c_rw_delay);
+        status_sum |= status;
+				HLdata[i] = (uint16_t)lsm_d[1] << 8;
+				
+				lsm_d[0] = 0x20 + 2*i;
+        lsm_d[1] = 0x00; // temperature data LOW
+        status = HAL_I2C_Mem_Read_IT(&hi2c1, lsm_addr, (uint16_t)lsm_d[0], 1, &lsm_d[1], 1);
+        delay_us(i2c_rw_delay);
+        status_sum |= status;
+        HLdata[i] |= lsm_d[1] ;
+				}			
+
+        if(status_sum)
+        {
+            LedStatus(HAL_ERROR);
+            status_sum = 0;
+        }
+        else
+        {
+            LedStatus(HAL_OK);
+        }
+// get imu real data
+        imu_real_data.acclx = (int16_t)HLdata[1] / accl_lsb;
+        imu_real_data.accly = (int16_t)HLdata[2] / accl_lsb;
+        imu_real_data.acclz = (int16_t)HLdata[3] / accl_lsb;
+        imu_real_data.gyrox = ((int16_t)HLdata[4] / gyro_lsb - 2.85f) * 0.0174532925f; //rad
+        imu_real_data.gyroy = ((int16_t)HLdata[5] / gyro_lsb + 1.8f) * 0.0174532925f;
+        imu_real_data.gyroz = ((int16_t)HLdata[6] / gyro_lsb + 1.65f) * 0.0174532925f;
+        sprintf(usb_string, "%9.5f,%9.5f,%9.5f,%9.5f,%9.5f,%9.5f,%d\n",
+                imu_real_data.acclx, imu_real_data.accly, imu_real_data.acclz,
+                imu_real_data.gyrox, imu_real_data.gyroy, imu_real_data.gyroz, HAL_GetTick());
+        CDC_Transmit_FS(usb_string,sizeof(usb_string));
+//fifo
+        RingBuffer_In(imu_fifo, &imu_real_data, sizeof(imu_real_data));
+    }
+    /* USER CODE END StartTaskMPU */
+}
+
+/* USER CODE BEGIN Application */
+void LedStatus(HAL_StatusTypeDef stat)
+{
+    switch(stat)
+    {
+    case HAL_OK:
+        led_delay = 1000;
+        break;
+    case HAL_ERROR:
+        led_delay = 500;
+        break;
+    case HAL_BUSY:
+        led_delay = 200;
+        break;
+    case HAL_TIMEOUT:
+        led_delay = 2000;
+        break;
+    default:
+        led_delay = 1000;
+        break;
+    }
+}
+
+/* USER CODE END Application */
+
