@@ -145,6 +145,7 @@ const osEventFlagsAttr_t myEventDataEnd_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 void LedStatus(HAL_StatusTypeDef stat);
+unsigned long RealNoise(unsigned long limit);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
